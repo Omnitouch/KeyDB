@@ -1,0 +1,259 @@
+name: Build .deb Package
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build .deb package
+    runs-on: self-hosted
+
+    steps:
+      - name: Clean workspace
+        run: |
+          sudo rm -rf $GITHUB_WORKSPACE/* $GITHUB_WORKSPACE/.* 2>/dev/null || true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            nasm \
+            autotools-dev \
+            autoconf \
+            libjemalloc-dev \
+            tcl \
+            tcl-dev \
+            uuid-dev \
+            libcurl4-openssl-dev \
+            libbz2-dev \
+            libzstd-dev \
+            liblz4-dev \
+            libsnappy-dev \
+            libssl-dev \
+            pkg-config
+
+      - name: Set build metadata
+        id: meta
+        run: |
+          DATETIME=$(git log -1 --format=%cd --date=format:%Y%m%d%H%M%S)
+          COMMIT=$(git rev-parse HEAD)
+          COMMIT_SHORT=$(git rev-parse --short HEAD)
+          BRANCH=${GITHUB_REF_NAME}
+          PACKAGE_NAME=keydb
+          VERSION=6.3.4+${DATETIME}
+          FILENAME=${PACKAGE_NAME}_${DATETIME}_${COMMIT_SHORT}_amd64
+          RELEASE_TAG=${PACKAGE_NAME}-${DATETIME}-${COMMIT_SHORT}
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "commit_short=${COMMIT_SHORT}" >> "$GITHUB_OUTPUT"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "package_name=${PACKAGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "filename=${FILENAME}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Build KeyDB
+        run: |
+          make distclean || true
+          make -j$(nproc) BUILD_TLS=yes
+
+      - name: Install to staging
+        run: |
+          mkdir -p staging/usr/local/bin staging/etc/keydb
+          make PREFIX=$(pwd)/staging/usr/local install
+
+      - name: Create default config
+        run: |
+          cat > staging/etc/keydb/keydb.conf.default << 'CFGEOF'
+          # KeyDB default configuration
+          bind 0.0.0.0
+          port 6379
+          daemonize no
+          pidfile /var/run/keydb/keydb-server.pid
+          logfile /var/log/keydb/keydb-server.log
+          dir /var/lib/keydb
+
+          # Authentication
+          # requirepass yourpassword
+          # masterauth yourpassword
+
+          # Active replication (multi-master)
+          # active-replica yes
+          # multi-master yes
+          # replicaof <master-ip> <master-port>
+
+          # Threading
+          server-threads 2
+
+          # Persistence
+          save 900 1
+          save 300 10
+          save 60 10000
+          appendonly yes
+          appendfsync everysec
+          CFGEOF
+
+      - name: Create systemd service
+        run: |
+          mkdir -p systemd
+          cat > systemd/keydb-server.service << 'SVCEOF'
+          [Unit]
+          Description=KeyDB Advanced Key-Value Store
+          After=network.target
+          Documentation=https://docs.keydb.dev
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/local/bin/keydb-server /etc/keydb/keydb.conf
+          ExecStop=/usr/local/bin/keydb-cli shutdown
+          User=keydb
+          Group=keydb
+          RuntimeDirectory=keydb
+          RuntimeDirectoryMode=0755
+          LimitNOFILE=65535
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          SVCEOF
+
+      - name: Create VERSION file
+        run: |
+          mkdir -p staging/usr/share/keydb
+          cat > staging/usr/share/keydb/VERSION << EOF
+          package=keydb
+          version=${{ steps.meta.outputs.version }}
+          branch=${{ steps.meta.outputs.branch }}
+          commit=${{ steps.meta.outputs.commit }}
+          commit_short=${{ steps.meta.outputs.commit_short }}
+          build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          build_host=github-actions
+          EOF
+
+      - name: Create postinstall script
+        run: |
+          cat > postinstall.sh << 'PIEOF'
+          #!/bin/bash
+          set -e
+
+          if ! id -u keydb >/dev/null 2>&1; then
+            useradd -r -s /usr/sbin/nologin keydb
+          fi
+
+          mkdir -p /var/lib/keydb /var/log/keydb /var/run/keydb /etc/keydb
+          chown -R keydb:keydb /var/lib/keydb /var/log/keydb /var/run/keydb
+
+          if [ ! -f /etc/keydb/keydb.conf ]; then
+            cp /etc/keydb/keydb.conf.default /etc/keydb/keydb.conf
+            chown keydb:keydb /etc/keydb/keydb.conf
+          fi
+
+          systemctl daemon-reload
+          echo "KeyDB installed successfully"
+          PIEOF
+          chmod +x postinstall.sh
+
+      - name: Create preremove script
+        run: |
+          cat > preremove.sh << 'PREOF'
+          #!/bin/bash
+          systemctl stop keydb-server.service || true
+          systemctl disable keydb-server.service || true
+          PREOF
+          chmod +x preremove.sh
+
+      - name: Install nfpm
+        run: |
+          mkdir -p $HOME/.local/bin
+          curl -sfL https://github.com/goreleaser/nfpm/releases/download/v2.46.0/nfpm_2.46.0_Linux_x86_64.tar.gz | tar xz -C $HOME/.local/bin nfpm
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Build .deb
+        run: |
+          cat > nfpm.yaml << NFPMEOF
+          name: keydb
+          arch: amd64
+          platform: linux
+          version: "${{ steps.meta.outputs.version }}"
+          section: database
+          priority: optional
+          maintainer: "Omnitouch <support@omnitouch.com.au>"
+          description: |
+            KeyDB - A Multithreaded Fork of Redis
+            High performance key-value store with active replication support
+            Branch: ${{ steps.meta.outputs.branch }}
+            Commit: ${{ steps.meta.outputs.commit_short }} (${{ steps.meta.outputs.commit }})
+          vendor: "Omnitouch"
+          homepage: "https://keydb.dev"
+          license: "BSD-3-Clause"
+          depends:
+            - libjemalloc2
+            - libssl3
+            - libcurl4
+            - libzstd1
+            - liblz4-1
+            - libsnappy1v5
+          contents:
+            - src: "staging/usr/local/bin"
+              dst: "/usr/local/bin"
+              type: tree
+            - src: "staging/etc/keydb"
+              dst: "/etc/keydb"
+              type: tree
+            - src: "staging/usr/share/keydb/VERSION"
+              dst: "/usr/share/keydb/VERSION"
+              file_info:
+                mode: 0644
+            - src: "systemd/keydb-server.service"
+              dst: "/lib/systemd/system/keydb-server.service"
+              file_info:
+                mode: 0644
+          scripts:
+            postinstall: ./postinstall.sh
+            preremove: ./preremove.sh
+          NFPMEOF
+          nfpm pkg --packager deb --config nfpm.yaml --target ${{ steps.meta.outputs.filename }}.deb
+          dpkg-deb --info ${{ steps.meta.outputs.filename }}.deb
+
+      - name: Create metadata JSON
+        run: |
+          cat > ${{ steps.meta.outputs.filename }}_metadata.json << EOF
+          {
+            "package_name": "keydb",
+            "commit_id": "${{ steps.meta.outputs.commit }}",
+            "commit_date": "$(git log -1 --format=%ci)",
+            "build_timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.filename }}.deb
+          path: |
+            ${{ steps.meta.outputs.filename }}.deb
+            ${{ steps.meta.outputs.filename }}_metadata.json
+
+      - name: Create GitHub Release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.release_tag }}
+          name: ${{ steps.meta.outputs.release_tag }}
+          body: |
+            **Branch:** ${{ steps.meta.outputs.branch }}
+            **Commit:** ${{ steps.meta.outputs.commit }}
+          files: |
+            ${{ steps.meta.outputs.filename }}.deb
+            ${{ steps.meta.outputs.filename }}_metadata.json
+          make_latest: true
