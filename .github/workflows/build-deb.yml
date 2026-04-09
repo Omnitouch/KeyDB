@@ -19,6 +19,12 @@ jobs:
         run: |
           sudo rm -rf $GITHUB_WORKSPACE/* $GITHUB_WORKSPACE/.* 2>/dev/null || true
 
+      - name: Install git (required for checkout to use native git)
+        run: |
+          sudo dpkg --configure -a || true
+          sudo apt-get update
+          sudo apt-get install -y git
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -53,7 +59,7 @@ jobs:
           VERSION=${DATETIME}.${COMMIT_SHORT}
           FILENAME=${PACKAGE_NAME}_${DATETIME}_${COMMIT_SHORT}_amd64
           RELEASE_TAG=${PACKAGE_NAME}-${DATETIME}-${COMMIT_SHORT}
-          echo \"version=${DATETIME}.${COMMIT_SHORT}\" >> \"$GITHUB_OUTPUT\"
+          echo "version=${DATETIME}.${COMMIT_SHORT}" >> "$GITHUB_OUTPUT"
           echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
           echo "commit_short=${COMMIT_SHORT}" >> "$GITHUB_OUTPUT"
           echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
