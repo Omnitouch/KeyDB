@@ -50,10 +50,10 @@ jobs:
           COMMIT_SHORT=$(git rev-parse --short HEAD)
           BRANCH=${GITHUB_REF_NAME}
           PACKAGE_NAME=keydb
-          VERSION=6.3.4+${DATETIME}
+          VERSION=${DATETIME}.${COMMIT_SHORT}
           FILENAME=${PACKAGE_NAME}_${DATETIME}_${COMMIT_SHORT}_amd64
           RELEASE_TAG=${PACKAGE_NAME}-${DATETIME}-${COMMIT_SHORT}
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo \"version=${DATETIME}.${COMMIT_SHORT}\" >> \"$GITHUB_OUTPUT\"
           echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
           echo "commit_short=${COMMIT_SHORT}" >> "$GITHUB_OUTPUT"
           echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
